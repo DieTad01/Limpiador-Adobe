@@ -1,24 +1,139 @@
 import Cocoa
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+// MARK: - Rutas a limpiar
+
+struct TempRoot {
+    let url: URL
+    let maxDepth: Int
+}
+
+struct CleanupPaths {
+    /// Registros (logs). Se pueden borrar aunque haya apps de Adobe abiertas.
+    let logs: [String]
+    /// Cachés normales. Solo con todas las apps de Adobe cerradas.
+    let caches: [String]
+    /// Media Cache de video. Solo con todas las apps de Adobe cerradas.
+    let deep: [String]
+    /// Carpetas temporales donde se buscan archivos temporales de Adobe.
+    let tempRoots: [TempRoot]
+
+    static func current() -> CleanupPaths {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+
+        // Carpeta temporal del usuario: /var/folders/xx/yyyy/T/ y su hermana C/
+        let userTemp = URL(fileURLWithPath: NSTemporaryDirectory())
+        let userCache = userTemp.deletingLastPathComponent().appendingPathComponent("C")
+
+        return CleanupPaths(
+            logs: [
+                "\(home)/Library/Logs/Adobe",
+                "\(home)/Library/Logs/CreativeCloud"
+            ],
+            caches: [
+                "\(home)/Library/Caches/Adobe",
+                "\(home)/Library/Caches/com.adobe.Photoshop",
+                "\(home)/Library/Caches/com.adobe.illustrator",
+                "\(home)/Library/Caches/com.adobe.PremierePro",
+                "\(home)/Library/Caches/com.adobe.AfterEffects"
+            ],
+            // "Team Projects Cache" NO se toca: puede tener cambios sin sincronizar.
+            deep: [
+                "\(home)/Library/Application Support/Adobe/Common/Media Cache",
+                "\(home)/Library/Application Support/Adobe/Common/Media Cache Files",
+                "\(home)/Library/Application Support/Adobe/Common/Peak Files"
+            ],
+            tempRoots: [
+                TempRoot(url: userTemp, maxDepth: 3),
+                TempRoot(url: userCache, maxDepth: 2),
+                TempRoot(url: URL(fileURLWithPath: "/private/tmp"), maxDepth: 1)
+            ]
+        )
+    }
+}
+
+// MARK: - Borrado de archivos (corre en segundo plano, no toca la interfaz)
+
+enum Cleaner {
+    static func clearDirectoryContents(_ path: String) {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(atPath: path) else { return }
+        for item in items {
+            try? fm.removeItem(atPath: (path as NSString).appendingPathComponent(item))
+        }
+    }
+
+    static func isAdobeTemp(_ name: String) -> Bool {
+        return name.hasPrefix("Photoshop Temp")
+            || name.hasPrefix("PSTemp")
+            || name.hasPrefix("AfterEffects")
+            || name.hasPrefix("com.adobe.AfterEffects")
+    }
+
+    /// Busca temporales de Adobe sin bajar más de `maxDepth` niveles,
+    /// para no recorrer todo el disco ni congelar la Mac.
+    static func removeAdobeTemps(in root: TempRoot) {
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(at: root.url,
+                                             includingPropertiesForKeys: nil,
+                                             options: [],
+                                             errorHandler: { _, _ in true }) else { return }
+        while let url = enumerator.nextObject() as? URL {
+            if isAdobeTemp(url.lastPathComponent) {
+                try? fm.removeItem(at: url)
+                enumerator.skipDescendants()
+            } else if enumerator.level >= root.maxDepth {
+                enumerator.skipDescendants()
+            }
+        }
+    }
+}
+
+enum CleanupResult {
+    case complete
+    case onlyLogs(String)   // había una app de Adobe abierta
+    case stopped(String)    // se abrió una app de Adobe a media limpieza
+}
+
+// MARK: - App de barra de menú
+
+@main
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var timer: Timer?
     var autoCleanEnabled = true
+    var isCleaning = false
     var statusMenuItem: NSMenuItem!
     var spaceMenuItem: NSMenuItem!
+    var cleanNowItem: NSMenuItem!
 
-    // Lista de procesos de Adobe a vigilar antes de borrar temporales activos
+    let workQueue = DispatchQueue(label: "com.agencia.Limpiador.limpieza", qos: .utility)
+
+    /// Apps de Adobe que, si están abiertas, bloquean la limpieza.
+    /// Además de esta lista, cualquier app de Adobe con ventana (en el Dock) también la bloquea.
     let adobeApps = [
-        "photoshop", "illustrator", "premiere", "after effects",
-        "afterfx", "media encoder", "indesign", "audition", "lightroom"
+        "photoshop", "illustrator", "premiere", "after effects", "afterfx",
+        "media encoder", "indesign", "incopy", "audition", "lightroom",
+        "bridge", "animate", "character animator", "acrobat", "dimension",
+        "substance", "dreamweaver", "fresco"
     ]
+
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        withExtendedLifetime(delegate) {
+            app.run()
+        }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "internaldrive", accessibilityDescription: "Adobe Cleaner")
+            button.image = NSImage(systemSymbolName: "internaldrive", accessibilityDescription: "Limpiador Adobe")
+            button.imagePosition = .imageLeft
         }
 
         setupMenu()
@@ -26,18 +141,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         runCleanup(manual: false)
     }
 
+    // MARK: Menú
+
     func setupMenu() {
         let menu = NSMenu()
+        menu.autoenablesItems = false
 
         spaceMenuItem = NSMenuItem(title: "Calculando espacio...", action: nil, keyEquivalent: "")
+        spaceMenuItem.isEnabled = false
         menu.addItem(spaceMenuItem)
 
         statusMenuItem = NSMenuItem(title: "Estado: Esperando", action: nil, keyEquivalent: "")
+        statusMenuItem.isEnabled = false
         menu.addItem(statusMenuItem)
 
         menu.addItem(NSMenuItem.separator())
 
-        let cleanNowItem = NSMenuItem(title: "🧹 Limpiar caché de Adobe ahora", action: #selector(manualClean), keyEquivalent: "l")
+        cleanNowItem = NSMenuItem(title: "🧹 Limpiar caché de Adobe ahora", action: #selector(manualClean), keyEquivalent: "l")
         cleanNowItem.target = self
         menu.addItem(cleanNowItem)
 
@@ -58,122 +178,183 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func startTimer() {
         timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 1800, repeats: true) { [weak self] _ in
-            guard let self = self, self.autoCleanEnabled else { return }
-            self.runCleanup(manual: false)
+        timer = Timer.scheduledTimer(timeInterval: 1800, target: self,
+                                     selector: #selector(timerFired), userInfo: nil, repeats: true)
+    }
+
+    @objc func timerFired() {
+        updateFreeSpaceLabel()
+        if autoCleanEnabled {
+            runCleanup(manual: false)
         }
     }
 
     @objc func toggleAutoClean(_ sender: NSMenuItem) {
         autoCleanEnabled.toggle()
         sender.state = autoCleanEnabled ? .on : .off
-        statusMenuItem.title = autoCleanEnabled ? "Estado: Activo (cada 30 min)" : "Estado: Pausado"
+        if !isCleaning {
+            statusMenuItem.title = autoCleanEnabled ? "Estado: Activo (cada 30 min)" : "Estado: Pausado"
+        }
     }
 
     @objc func manualClean() {
         runCleanup(manual: true)
     }
 
+    @objc func quitApp() {
+        NSApp.terminate(nil)
+    }
+
+    // MARK: Detección de Adobe
+
     func getRunningAdobeApp() -> String? {
-        let apps = NSWorkspace.shared.runningApplications
-        for app in apps {
+        for app in NSWorkspace.shared.runningApplications {
+            if app == NSRunningApplication.current { continue }
+
             let name = (app.localizedName ?? "").lowercased()
             let bundle = (app.bundleIdentifier ?? "").lowercased()
-            for target in adobeApps {
-                if name.contains(target) || bundle.contains(target) {
-                    return app.localizedName ?? "Adobe App"
-                }
+
+            let isAdobe = bundle.hasPrefix("com.adobe.") || name.contains("adobe")
+            guard isAdobe else { continue }
+
+            // Creative Cloud siempre está abierto y no usa estas cachés; no debe bloquear.
+            if bundle.hasPrefix("com.adobe.acc") || name.contains("creative cloud") { continue }
+
+            let hasWindow = app.activationPolicy == .regular
+            let isKnownApp = adobeApps.contains { name.contains($0) || bundle.contains($0) }
+            if hasWindow || isKnownApp {
+                return app.localizedName ?? "Una app de Adobe"
             }
         }
         return nil
     }
 
-    func updateFreeSpaceLabel() {
-        if let attrs = try? FileManager.default.attributesOfFileSystem(forPath: "/"),
-           let freeSize = attrs[.systemFreeSize] as? Int64 {
-            let gb = Double(freeSize) / 1_073_741_824.0
-            spaceMenuItem.title = String(format: "💾 Espacio libre: %.1f GB", gb)
-            statusItem.button?.title = String(format: " %.0fGB", gb)
-        }
-    }
+    // MARK: Limpieza
 
     func runCleanup(manual: Bool) {
-        let activeApp = getRunningAdobeApp()
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-
-        // 1. Limpieza ligera segura (se puede ejecutar aunque haya apps abiertas)
-        let safePaths = [
-            "\(home)/Library/Caches/Adobe",
-            "\(home)/Library/Caches/com.adobe.Photoshop",
-            "\(home)/Library/Caches/com.adobe.illustrator",
-            "\(home)/Library/Caches/com.adobe.PremierePro",
-            "\(home)/Library/Caches/com.adobe.AfterEffects",
-            "\(home)/Library/Logs/Adobe",
-            "\(home)/Library/Logs/CreativeCloud"
-        ]
-        for path in safePaths {
-            clearDirectoryContents(at: path)
-        }
-
-        // 2. Limpieza profunda (Media Cache de video + Scratch Disks) solo si todo Adobe está cerrado
-        if activeApp == nil {
-            let deepCachePaths = [
-                "\(home)/Library/Application Support/Adobe/Common/Media Cache",
-                "\(home)/Library/Application Support/Adobe/Common/Media Cache Files",
-                "\(home)/Library/Application Support/Adobe/Common/Peak Files",
-                "\(home)/Library/Application Support/Adobe/Common/Team Projects Cache"
-            ]
-            for path in deepCachePaths {
-                clearDirectoryContents(at: path)
-            }
-
-            // Temporales del sistema de Photoshop, Illustrator y After Effects
-            let tempRoots = ["/tmp", "/private/var/folders"]
-            for root in tempRoots {
-                removeAdobeSystemTemps(in: root)
-            }
-        }
-
-        updateFreeSpaceLabel()
-
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm"
-        let hora = formatter.string(from: Date())
-
-        if let appName = activeApp {
-            statusMenuItem.title = "⚠️ \(hora) - \(appName) abierto (caché ligera)"
+        if isCleaning {
             if manual {
-                showAlert(title: "\(appName) está abierto",
-                          text: "Se limpiaron logs y cachés ligeras. Cierra todas las apps de Adobe para purgar Media Cache y Scratch Disks pesados.")
+                showAlert(title: "Ya hay una limpieza en curso",
+                          text: "Espera a que termine y vuelve a intentarlo.")
             }
-        } else {
-            statusMenuItem.title = "✅ \(hora) - Suite Adobe limpia"
+            return
+        }
+
+        let openApp = getRunningAdobeApp()
+
+        // Auto-limpieza: si hay algo de Adobe abierto, no se toca absolutamente nada.
+        if let appName = openApp, !manual {
+            statusMenuItem.title = "⏸️ \(currentTime()) - \(appName) abierto, no se limpió"
+            updateFreeSpaceLabel()
+            return
+        }
+
+        setCleaning(true)
+        let paths = CleanupPaths.current()
+
+        if let appName = openApp {
+            // Limpieza manual con Adobe abierto: solo registros (logs).
+            workQueue.async {
+                paths.logs.forEach(Cleaner.clearDirectoryContents)
+                DispatchQueue.main.async {
+                    self.finishCleanup(manual: manual, result: .onlyLogs(appName))
+                }
+            }
+            return
+        }
+
+        // Paso 1: logs y cachés normales.
+        workQueue.async {
+            (paths.logs + paths.caches).forEach(Cleaner.clearDirectoryContents)
+            DispatchQueue.main.async {
+                self.runDeepCleanup(manual: manual, paths: paths)
+            }
+        }
+    }
+
+    /// Paso 2: Media Cache y temporales. Se vuelve a revisar que Adobe siga cerrado.
+    func runDeepCleanup(manual: Bool, paths: CleanupPaths) {
+        if let appName = getRunningAdobeApp() {
+            finishCleanup(manual: manual, result: .stopped(appName))
+            return
+        }
+
+        workQueue.async {
+            paths.deep.forEach(Cleaner.clearDirectoryContents)
+            paths.tempRoots.forEach(Cleaner.removeAdobeTemps)
+            DispatchQueue.main.async {
+                self.finishCleanup(manual: manual, result: .complete)
+            }
+        }
+    }
+
+    func setCleaning(_ cleaning: Bool) {
+        isCleaning = cleaning
+        cleanNowItem.isEnabled = !cleaning
+        if cleaning {
+            statusMenuItem.title = "🧹 Limpiando..."
+        }
+    }
+
+    func finishCleanup(manual: Bool, result: CleanupResult) {
+        setCleaning(false)
+        updateFreeSpaceLabel()
+        let time = currentTime()
+
+        switch result {
+        case .complete:
+            statusMenuItem.title = "✅ \(time) - Caché de Adobe limpia"
             if manual {
                 showAlert(title: "Limpieza completa de Adobe",
-                          text: "Se eliminaron Media Cache, archivos temporales de Photoshop/Illustrator y cachés de Creative Cloud.")
+                          text: "Se borraron Media Cache, cachés y temporales de Adobe.\n\(freeSpaceText())")
+            }
+        case .onlyLogs(let appName):
+            statusMenuItem.title = "⚠️ \(time) - \(appName) abierto (solo logs)"
+            if manual {
+                showAlert(title: "\(appName) está abierto",
+                          text: "Para no afectar tu trabajo solo se borraron los registros (logs). Cierra todas las apps de Adobe y vuelve a limpiar para borrar cachés y Media Cache.")
+            }
+        case .stopped(let appName):
+            statusMenuItem.title = "⚠️ \(time) - Se detuvo: se abrió \(appName)"
+            if manual {
+                showAlert(title: "Limpieza detenida",
+                          text: "Se abrió \(appName), así que no se borró Media Cache ni temporales. Ciérralo y vuelve a limpiar.")
             }
         }
     }
 
-    func clearDirectoryContents(at path: String) {
-        let fm = FileManager.default
-        guard let items = try? fm.contentsOfDirectory(atPath: path) else { return }
-        for item in items {
-            try? fm.removeItem(atPath: "\(path)/\(item)")
+    // MARK: Espacio libre
+
+    func freeSpaceGB() -> Double? {
+        let root = URL(fileURLWithPath: "/")
+        if let values = try? root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+           let bytes = values.volumeAvailableCapacityForImportantUsage, bytes > 0 {
+            return Double(bytes) / 1_000_000_000
         }
+        if let attrs = try? FileManager.default.attributesOfFileSystem(forPath: "/"),
+           let bytes = attrs[.systemFreeSize] as? Int64 {
+            return Double(bytes) / 1_000_000_000
+        }
+        return nil
     }
 
-    func removeAdobeSystemTemps(in directory: String) {
-        let fm = FileManager.default
-        guard let enumerator = fm.enumerator(atPath: directory) else { return }
-        while let file = enumerator.nextObject() as? String {
-            if file.contains("Photoshop Temp") ||
-               file.contains("PSTemp") ||
-               file.contains("AfterEffects") ||
-               file.hasPrefix("AI_") {
-                try? fm.removeItem(atPath: "\(directory)/\(file)")
-            }
-        }
+    func freeSpaceText() -> String {
+        guard let gb = freeSpaceGB() else { return "" }
+        return String(format: "Espacio libre ahora: %.1f GB", gb)
+    }
+
+    func updateFreeSpaceLabel() {
+        guard let gb = freeSpaceGB() else { return }
+        spaceMenuItem.title = String(format: "💾 Espacio libre: %.1f GB", gb)
+        statusItem.button?.title = String(format: " %.0fGB", gb)
+    }
+
+    // MARK: Utilidades
+
+    func currentTime() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        return formatter.string(from: Date())
     }
 
     func showAlert(title: String, text: String) {
@@ -184,13 +365,4 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         alert.alertStyle = .informational
         alert.runModal()
     }
-
-    @objc func quitApp() {
-        NSApp.terminate(nil)
-    }
 }
-
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.run()

@@ -14,20 +14,26 @@ jobs:
 
       - name: Compilar Binario Universal (Intel + Apple Silicon)
         run: |
+          set -euo pipefail
           mkdir -p Limpiador.app/Contents/MacOS
 
-          # Compilar para Apple Silicon (M1/M2/M3/M4) desde macOS 11
-          swiftc Limpiador.swift -o bin_arm64 -target arm64-apple-macos11.0
+          # -parse-as-library: el punto de entrada es @main dentro del código
+          FLAGS="-O -parse-as-library -swift-version 5"
 
-          # Compilar para Intel (Mac antiguas) desde macOS 11
-          swiftc Limpiador.swift -o bin_x86 -target x86_64-apple-macos11.0
+          # Apple Silicon (M1/M2/M3/M4) desde macOS 11
+          swiftc $FLAGS Limpiador.swift -o bin_arm64 -target arm64-apple-macos11.0
+
+          # Intel (Mac antiguas) desde macOS 11
+          swiftc $FLAGS Limpiador.swift -o bin_x86 -target x86_64-apple-macos11.0
 
           # Unir ambos en un solo ejecutable Universal
           lipo -create -output Limpiador.app/Contents/MacOS/Limpiador bin_arm64 bin_x86
           chmod +x Limpiador.app/Contents/MacOS/Limpiador
+          lipo -info Limpiador.app/Contents/MacOS/Limpiador
 
       - name: Crear Info.plist y firmar paquete
         run: |
+          set -euo pipefail
           cat << 'EOF' > Limpiador.app/Contents/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -39,20 +45,28 @@ jobs:
               <string>com.agencia.Limpiador</string>
               <key>CFBundleName</key>
               <string>Limpiador</string>
+              <key>CFBundleDisplayName</key>
+              <string>Limpiador</string>
               <key>CFBundlePackageType</key>
               <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>1.1</string>
               <key>CFBundleVersion</key>
-              <string>1.0</string>
+              <string>2</string>
               <key>LSMinimumSystemVersion</key>
               <string>11.0</string>
               <key>LSUIElement</key>
               <true/>
+              <key>NSHighResolutionCapable</key>
+              <true/>
           </dict>
           </plist>
           EOF
+          plutil -lint Limpiador.app/Contents/Info.plist
 
           # Firma ad-hoc obligatoria para que Apple Silicon no rechace el binario
           codesign --force --deep --sign - Limpiador.app
+          codesign --verify --verbose Limpiador.app
 
           # Empaquetar conservando permisos y firmas de macOS
           ditto -c -k --sequesterRsrc --keepParent Limpiador.app LimpiadorAdobe-Universal.zip
