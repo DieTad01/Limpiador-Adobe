@@ -1,0 +1,64 @@
+name: Compilar Limpiador Adobe Universal
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-universal-mac:
+    runs-on: macos-latest
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v4
+
+      - name: Compilar Binario Universal (Intel + Apple Silicon)
+        run: |
+          mkdir -p LimpiadorAdobe.app/Contents/MacOS
+
+          # Compilar para Apple Silicon (M1/M2/M3/M4) desde macOS 11
+          swiftc LimpiadorAdobe.swift -o bin_arm64 -target arm64-apple-macos11.0
+
+          # Compilar para Intel (Mac antiguas) desde macOS 11
+          swiftc LimpiadorAdobe.swift -o bin_x86 -target x86_64-apple-macos11.0
+
+          # Unir ambos en un solo ejecutable Universal
+          lipo -create -output LimpiadorAdobe.app/Contents/MacOS/LimpiadorAdobe bin_arm64 bin_x86
+          chmod +x LimpiadorAdobe.app/Contents/MacOS/LimpiadorAdobe
+
+      - name: Crear Info.plist y firmar paquete
+        run: |
+          cat << 'EOF' > LimpiadorAdobe.app/Contents/Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>LimpiadorAdobe</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.agencia.LimpiadorAdobe</string>
+              <key>CFBundleName</key>
+              <string>Limpiador Adobe</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleVersion</key>
+              <string>1.0</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>11.0</string>
+              <key>LSUIElement</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+
+          # Firma ad-hoc obligatoria para que Apple Silicon no rechace el binario
+          codesign --force --deep --sign - LimpiadorAdobe.app
+
+          # Empaquetar conservando permisos y firmas de macOS
+          ditto -c -k --sequesterRsrc --keepParent LimpiadorAdobe.app LimpiadorAdobe-Universal.zip
+
+      - name: Subir instalador listo para descargar
+        uses: actions/upload-artifact@v4
+        with:
+          name: LimpiadorAdobe-Mac
+          path: LimpiadorAdobe-Universal.zip
