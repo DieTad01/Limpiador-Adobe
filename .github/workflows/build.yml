@@ -23,8 +23,8 @@ jobs:
           swiftc Limpiador.swift -o bin_x86 -target x86_64-apple-macos11.0
 
           # Unir ambos en un solo ejecutable Universal
-          lipo -create -output Limpiador.app/Contents/MacOS/LimpiadorAdobe bin_arm64 bin_x86
-          chmod +x Limpiador.app/Contents/MacOS/LimpiadorAdobe
+          lipo -create -output Limpiador.app/Contents/MacOS/Limpiador bin_arm64 bin_x86
+          chmod +x Limpiador.app/Contents/MacOS/Limpiador
 
       - name: Crear Info.plist y firmar paquete
         run: |
@@ -34,11 +34,11 @@ jobs:
           <plist version="1.0">
           <dict>
               <key>CFBundleExecutable</key>
-              <string>LimpiadorAdobe</string>
+              <string>Limpiador</string>
               <key>CFBundleIdentifier</key>
-              <string>com.agencia.LimpiadorAdobe</string>
+              <string>com.agencia.Limpiador</string>
               <key>CFBundleName</key>
-              <string>Limpiador Adobe</string>
+              <string>Limpiador</string>
               <key>CFBundlePackageType</key>
               <string>APPL</string>
               <key>CFBundleVersion</key>
