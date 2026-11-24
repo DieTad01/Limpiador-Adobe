@@ -14,21 +14,21 @@ jobs:
 
       - name: Compilar Binario Universal (Intel + Apple Silicon)
         run: |
-          mkdir -p LimpiadorAdobe.app/Contents/MacOS
+          mkdir -p Limpiador.app/Contents/MacOS
 
           # Compilar para Apple Silicon (M1/M2/M3/M4) desde macOS 11
-          swiftc LimpiadorAdobe.swift -o bin_arm64 -target arm64-apple-macos11.0
+          swiftc Limpiador.swift -o bin_arm64 -target arm64-apple-macos11.0
 
           # Compilar para Intel (Mac antiguas) desde macOS 11
-          swiftc LimpiadorAdobe.swift -o bin_x86 -target x86_64-apple-macos11.0
+          swiftc Limpiador.swift -o bin_x86 -target x86_64-apple-macos11.0
 
           # Unir ambos en un solo ejecutable Universal
-          lipo -create -output LimpiadorAdobe.app/Contents/MacOS/LimpiadorAdobe bin_arm64 bin_x86
-          chmod +x LimpiadorAdobe.app/Contents/MacOS/LimpiadorAdobe
+          lipo -create -output Limpiador.app/Contents/MacOS/LimpiadorAdobe bin_arm64 bin_x86
+          chmod +x Limpiador.app/Contents/MacOS/LimpiadorAdobe
 
       - name: Crear Info.plist y firmar paquete
         run: |
-          cat << 'EOF' > LimpiadorAdobe.app/Contents/Info.plist
+          cat << 'EOF' > Limpiador.app/Contents/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -52,10 +52,10 @@ jobs:
           EOF
 
           # Firma ad-hoc obligatoria para que Apple Silicon no rechace el binario
-          codesign --force --deep --sign - LimpiadorAdobe.app
+          codesign --force --deep --sign - Limpiador.app
 
           # Empaquetar conservando permisos y firmas de macOS
-          ditto -c -k --sequesterRsrc --keepParent LimpiadorAdobe.app LimpiadorAdobe-Universal.zip
+          ditto -c -k --sequesterRsrc --keepParent Limpiador.app LimpiadorAdobe-Universal.zip
 
       - name: Subir instalador listo para descargar
         uses: actions/upload-artifact@v4
